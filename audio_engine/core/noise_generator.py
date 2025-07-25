@@ -41,7 +41,7 @@ class NoiseGenerator:
         use_cuda: bool = True,
         therapeutic_eq: bool = True,
         fade_duration: float = 5.0,
-        oversampling_factor: int = 4
+        oversampling_factor: int = 1  # Disabled by default for performance
     ):
         """
         Initialize the NoiseGenerator.
@@ -282,31 +282,13 @@ class NoiseGenerator:
         Returns:
             torch.Tensor: DC-corrected audio
         """
-        # Simple high-pass filter at 1.5Hz
-        cutoff = 1.5  # Hz
-        nyquist = self.sample_rate / 2
-        normalized_cutoff = cutoff / nyquist
-        
-        # First-order high-pass filter coefficients
-        alpha = np.exp(-2 * np.pi * normalized_cutoff)
-        
-        # Apply filter to each channel
-        filtered_audio = torch.zeros_like(audio)
-        
+        # Simple DC removal - subtract mean from each channel
+        # This is much faster than the iterative high-pass filter
+        # and sufficient for DC offset removal
         for ch in range(audio.shape[0]):
-            # Apply first-order high-pass filter
-            y_prev = 0
-            x_prev = 0
-            
-            for i in range(audio.shape[1]):
-                x = audio[ch, i].item()
-                y = alpha * y_prev + alpha * (x - x_prev)
-                filtered_audio[ch, i] = y
-                
-                y_prev = y
-                x_prev = x
+            audio[ch] = audio[ch] - torch.mean(audio[ch])
         
-        return filtered_audio
+        return audio
     
     def _perform_quality_checks(self, audio: torch.Tensor, noise_type: str) -> None:
         """

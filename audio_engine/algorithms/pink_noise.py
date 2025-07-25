@@ -8,6 +8,7 @@ distribution across octaves with proper 1/f spectral density.
 import torch
 import numpy as np
 from typing import Tuple, Optional
+import torch.jit
 
 
 class PinkNoiseAlgorithm:
@@ -45,8 +46,8 @@ class PinkNoiseAlgorithm:
         Returns:
             torch.Tensor: Pink noise audio data [channels, samples]
         """
-        # Generate base pink noise for one channel
-        pink_mono = self._generate_voss_mccartney(duration_samples)
+        # Always use Voss-McCartney for highest quality
+        pink_mono = self._generate_voss_mccartney_optimized(duration_samples)
         
         if channels == 1:
             return pink_mono.unsqueeze(0)
@@ -63,9 +64,11 @@ class PinkNoiseAlgorithm:
         else:
             raise ValueError(f"Unsupported channel count: {channels}")
     
-    def _generate_voss_mccartney(self, duration_samples: int) -> torch.Tensor:
+    
+    def _generate_voss_mccartney_optimized(self, duration_samples: int) -> torch.Tensor:
         """
-        Generate pink noise using the Voss-McCartney algorithm.
+        Optimized Voss-McCartney algorithm using torch operations.
+        Maintains algorithm accuracy while improving performance.
         
         Args:
             duration_samples: Number of samples to generate
@@ -73,23 +76,114 @@ class PinkNoiseAlgorithm:
         Returns:
             torch.Tensor: Pink noise samples
         """
+        # Initialize
         output = torch.zeros(duration_samples, device=self.device)
+        sources = torch.zeros(self.num_sources, device=self.device)
         
-        # Reset sources for consistent generation
-        self.sources.fill_(0.0)
-        self.counters.fill_(0)
+        # Optimize by processing in chunks and pre-generating random values
+        chunk_size = 10000  # Smaller chunks for better accuracy
         
-        for i in range(duration_samples):
-            # Update sources based on bit patterns
-            for j in range(self.num_sources):
-                if (i >> j) & 1 != (max(0, i-1) >> j) & 1:
-                    self.sources[j] = torch.randn(1, generator=self.generator, device=self.device)
+        for chunk_start in range(0, duration_samples, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, duration_samples)
+            chunk_len = chunk_end - chunk_start
             
-            # Sum all sources to create pink noise
-            output[i] = torch.sum(self.sources)
+            # Pre-generate random values for all possible updates in this chunk
+            # This is MUCH faster than calling randn repeatedly
+            random_matrix = torch.randn(
+                self.num_sources, chunk_len,
+                generator=self.generator, device=self.device
+            )
+            
+            # Process each sample
+            for i in range(chunk_len):
+                sample_idx = chunk_start + i
+                
+                # Voss-McCartney: update sources based on bit transitions
+                for j in range(self.num_sources):
+                    # Check if bit j changed from previous sample
+                    if sample_idx == 0:
+                        # First sample: update if bit is set
+                        if (sample_idx >> j) & 1:
+                            sources[j] = random_matrix[j, i]
+                    else:
+                        # Check for bit transition
+                        prev_bit = ((sample_idx - 1) >> j) & 1
+                        curr_bit = (sample_idx >> j) & 1
+                        if curr_bit != prev_bit:
+                            sources[j] = random_matrix[j, i]
+                
+                # Sum all sources
+                output[sample_idx] = sources.sum()
+        
+        # Normalize
+        output = output / np.sqrt(self.num_sources)
+        
+        # Apply filter to improve 1/f characteristic
+        output = self._apply_pink_filter(output)
+        
+        return output
+    
+    def _generate_voss_mccartney_vectorized(self, duration_samples: int) -> torch.Tensor:
+        """
+        Generate pink noise using the Voss-McCartney algorithm.
+        Optimized implementation using vectorized operations.
+        
+        Args:
+            duration_samples: Number of samples to generate
+            
+        Returns:
+            torch.Tensor: Pink noise samples
+        """
+        # Initialize output and sources
+        output = torch.zeros(duration_samples, device=self.device)
+        self.sources.fill_(0.0)
+        
+        # Pre-generate all random values for efficiency
+        # This is much faster than generating on-demand
+        chunk_size = min(duration_samples, 1000000)  # Process in 1M sample chunks for memory efficiency
+        
+        for chunk_start in range(0, duration_samples, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, duration_samples)
+            chunk_length = chunk_end - chunk_start
+            
+            # Pre-calculate which sources need updating for each sample in the chunk
+            # This vectorizes the bit manipulation logic
+            sample_indices = torch.arange(chunk_start, chunk_end, device=self.device)
+            
+            # For each source, determine when it needs updating
+            for j in range(self.num_sources):
+                # Calculate bit transitions for this source
+                if chunk_start == 0:
+                    # First chunk: check against 0
+                    current_bits = (sample_indices >> j) & 1
+                    prev_bits = torch.zeros_like(current_bits)
+                    prev_bits[1:] = current_bits[:-1]
+                else:
+                    # Subsequent chunks: check against previous sample
+                    current_bits = (sample_indices >> j) & 1
+                    prev_indices = sample_indices - 1
+                    prev_bits = (prev_indices >> j) & 1
+                
+                # Find where bit transitions occur
+                transitions = current_bits != prev_bits
+                transition_indices = torch.where(transitions)[0]
+                
+                # Generate new random values only where needed
+                if len(transition_indices) > 0:
+                    new_values = torch.randn(len(transition_indices), generator=self.generator, device=self.device)
+                    
+                    # Update the source value at transition points
+                    for idx, trans_idx in enumerate(transition_indices):
+                        if chunk_start + trans_idx < duration_samples:
+                            self.sources[j] = new_values[idx]
+                            # Update output from this point forward in the chunk
+                            output[chunk_start + trans_idx:chunk_end] += self.sources[j] - (self.sources[j] / self.num_sources * (self.num_sources - 1))
+            
+            # Add the current sum of sources to this chunk
+            output[chunk_start:chunk_end] += torch.sum(self.sources)
         
         # Normalize to prevent clipping
-        output = output / torch.sqrt(torch.tensor(self.num_sources, device=self.device))
+        output = output / torch.sqrt(torch.tensor(self.num_sources, dtype=output.dtype, device=self.device))
         
         # Apply additional filtering for better 1/f characteristic
         output = self._apply_pink_filter(output)
@@ -99,6 +193,7 @@ class PinkNoiseAlgorithm:
     def _apply_pink_filter(self, signal: torch.Tensor) -> torch.Tensor:
         """
         Apply additional filtering to improve 1/f characteristic.
+        Optimized using FFT-based filtering for long signals.
         
         Args:
             signal: Input signal to filter
@@ -106,22 +201,42 @@ class PinkNoiseAlgorithm:
         Returns:
             torch.Tensor: Filtered pink noise
         """
-        # Simple first-order high-pass to improve low-frequency rolloff
-        # This compensates for the Voss-McCartney algorithm's slight deviation from ideal 1/f
-        
         if len(signal) < 2:
             return signal
         
-        # First-order high-pass filter coefficients
-        # Designed to flatten the low-frequency response
-        a = 0.99
-        filtered = torch.zeros_like(signal)
-        filtered[0] = signal[0]
-        
-        for i in range(1, len(signal)):
-            filtered[i] = a * filtered[i-1] + signal[i] - signal[i-1]
-        
-        return filtered
+        # For long signals, use FFT-based filtering (much faster)
+        if len(signal) > 10000:
+            # Work in chunks to manage memory
+            chunk_size = min(len(signal), self.sample_rate * 60)  # 1 minute chunks
+            filtered_chunks = []
+            
+            for start in range(0, len(signal), chunk_size):
+                end = min(start + chunk_size, len(signal))
+                chunk = signal[start:end]
+                
+                # Apply mild high-pass filter to compensate for
+                # Voss-McCartney's slight low-frequency emphasis
+                # FFT
+                spectrum = torch.fft.rfft(chunk)
+                freqs = torch.fft.rfftfreq(len(chunk), 1/self.sample_rate, device=self.device)
+                
+                # Gentle high-pass filter (very subtle correction)
+                # This preserves the Voss-McCartney character while improving flatness
+                freqs[0] = 1.0  # Avoid division by zero
+                correction_filter = 1.0 - torch.exp(-freqs / 10.0)  # Gentle curve
+                correction_filter[0] = 0.0  # Remove DC
+                
+                # Apply correction
+                spectrum = spectrum * correction_filter
+                
+                # IFFT
+                filtered_chunk = torch.fft.irfft(spectrum, n=len(chunk))
+                filtered_chunks.append(filtered_chunk)
+            
+            return torch.cat(filtered_chunks)
+        else:
+            # For short signals, use simple DC removal
+            return signal - torch.mean(signal)
     
     def verify_spectral_density(self, signal: torch.Tensor) -> dict:
         """

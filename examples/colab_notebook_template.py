@@ -106,13 +106,15 @@ Generate therapeutic noise based on your configuration.
 """
 
 # Initialize generator with settings
+# OPTIMIZED FOR LONG DURATIONS: oversampling_factor=1
 generator = NoiseGenerator(
     sample_rate=48000,
     bit_depth=24,
     target_lufs=-14.0,
     use_cuda=cuda_widget.value,
     therapeutic_eq=therapeutic_widget.value,
-    fade_duration=5.0
+    fade_duration=5.0,
+    oversampling_factor=1  # Disabled for faster generation
 )
 
 print("🎵 Generating Therapeutic Audio...")

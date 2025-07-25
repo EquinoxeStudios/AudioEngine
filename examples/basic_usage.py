@@ -75,6 +75,29 @@ def main():
     print(f"  Therapeutic Processing: {stats['therapeutic_processing']}")
     
     print("\n🎉 Basic usage complete! Check the generated FLAC files.")
+    
+    # Show optimized example for long durations
+    print("\n" + "=" * 50)
+    print("⚡ QUICK EXAMPLE: Generate 60 minutes FAST")
+    print("=" * 50)
+    print("\n# For Google Colab - Optimized 60-minute generation:")
+    print("from audio_engine import NoiseGenerator")
+    print("import time")
+    print("")
+    print("# Create optimized generator")
+    print("generator = NoiseGenerator(")
+    print("    oversampling_factor=1,  # No oversampling = 4x faster")
+    print("    therapeutic_eq=False,   # No extra processing = faster")
+    print("    use_cuda=True          # Use GPU if available")
+    print(")")
+    print("")
+    print("# Generate 60 minutes")
+    print("start = time.time()")
+    print("audio = generator.generate_pink_noise(60)")
+    print("print(f'Generated in {time.time()-start:.1f} seconds')")
+    print("")
+    print("# Export")
+    print("generator.export_flac('pink_noise_60min.flac', audio, 'pink', 60)")
 
 
 if __name__ == "__main__":
