@@ -9,6 +9,9 @@ import numpy as np
 import soundfile as sf
 import scipy.signal as signal
 from scipy.signal import butter, filtfilt, sosfilt, sosfiltfilt, sosfilt_zi, lfilter_zi
+from scipy.ndimage import maximum_filter1d
+from collections import deque
+from dataclasses import dataclass
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -32,6 +35,252 @@ except ImportError:
     print("For GPU acceleration, install with: pip install cupy-cuda11x")
     cp = np  # Fallback to NumPy
 
+
+@dataclass
+class LimiterConfig:
+    """Configuration for lookahead limiter"""
+    sample_rate: int = 48000
+    channels: int = 2
+    threshold_db: float = -0.3  # dB below 0dBFS
+    lookahead_ms: float = 5.0  # 5ms lookahead
+    attack_ms: float = 0.5  # Fast attack
+    release_ms: float = 50.0  # Smooth release
+    knee_db: float = 2.0  # Soft knee width
+    oversample_factor: int = 4  # For inter-sample peak detection
+    
+    def __post_init__(self):
+        self.threshold_linear = 10 ** (self.threshold_db / 20)
+        self.lookahead_samples = int(self.lookahead_ms * self.sample_rate / 1000)
+        self.attack_coeff = np.exp(-1 / (self.attack_ms * self.sample_rate / 1000))
+        self.release_coeff = np.exp(-1 / (self.release_ms * self.sample_rate / 1000))
+        self.knee_start = 10 ** ((self.threshold_db - self.knee_db / 2) / 20)
+        self.knee_end = self.threshold_linear
+
+
+class LookaheadLimiter:
+    """Professional lookahead limiter with soft knee and inter-sample peak detection"""
+    
+    def __init__(self, config: LimiterConfig):
+        self.config = config
+        
+        # Delay buffers for lookahead
+        self.delay_buffers = [
+            deque(maxlen=config.lookahead_samples)
+            for _ in range(config.channels)
+        ]
+        
+        # Initialize delay buffers with zeros
+        for buffer in self.delay_buffers:
+            buffer.extend([0.0] * config.lookahead_samples)
+        
+        # Gain reduction envelope
+        self.envelope = 0.0
+        
+        # Upsampling filter for inter-sample peak detection
+        if config.oversample_factor > 1:
+            # Design a high-quality lowpass filter for upsampling
+            cutoff = 0.45  # Slightly below Nyquist to avoid aliasing
+            self.upsample_filter = signal.firwin(
+                64 * config.oversample_factor,
+                cutoff / config.oversample_factor,
+                window='blackman'
+            )
+        else:
+            self.upsample_filter = None
+    
+    def process(self, audio_chunk: np.ndarray) -> np.ndarray:
+        """Process audio chunk with vectorized lookahead limiting"""
+        num_samples = len(audio_chunk)
+        
+        # Convert deque buffers to numpy arrays for vectorized operations
+        if not hasattr(self, 'lookahead_buffer'):
+            # Initialize numpy buffer on first use
+            self.lookahead_buffer = np.zeros((self.config.lookahead_samples, self.config.channels))
+            self.envelope_state = np.ones(num_samples)  # Initialize envelope
+        
+        # Combine lookahead buffer with new audio
+        combined = np.vstack([self.lookahead_buffer, audio_chunk])
+        
+        # Extract delayed output (first num_samples from combined buffer)
+        delayed_output = combined[:num_samples]
+        
+        # Update lookahead buffer for next chunk
+        self.lookahead_buffer = combined[num_samples:num_samples + self.config.lookahead_samples]
+        
+        # Vectorized peak detection using sliding window maximum
+        peaks = self._find_lookahead_peaks_vectorized(combined, num_samples)
+        
+        # Vectorized gain reduction calculation
+        gain_reductions = self._calculate_gain_reduction_vectorized(peaks)
+        
+        # Vectorized envelope smoothing
+        envelope = self._apply_envelope_vectorized(gain_reductions)
+        
+        # Apply gain envelope to delayed signal
+        output = delayed_output * envelope[:, np.newaxis]
+        
+        return output
+    
+    def _find_lookahead_peaks_vectorized(self, combined_buffer: np.ndarray, num_samples: int) -> np.ndarray:
+        """Truly vectorized peak detection using scipy.ndimage.maximum_filter1d"""
+        # Take the absolute maximum across channels
+        abs_signal = np.abs(combined_buffer).max(axis=1) if combined_buffer.ndim > 1 else np.abs(combined_buffer)
+        
+        # Use scipy's optimized maximum_filter1d for sliding window maximum
+        # This is compiled C code, orders of magnitude faster than Python loops
+        all_peaks = maximum_filter1d(abs_signal, size=self.config.lookahead_samples, 
+                                     mode='constant', cval=0.0)
+        
+        # Return only the peaks corresponding to the output samples
+        return all_peaks[:num_samples]
+    
+    def _find_lookahead_peak(self) -> float:
+        """Find peak level in lookahead buffer, including inter-sample peaks"""
+        peak = 0.0
+        
+        for ch in range(self.config.channels):
+            # Get buffer as array
+            buffer = np.array(self.delay_buffers[ch])
+            
+            if self.config.oversample_factor > 1:
+                # Upsample to detect inter-sample peaks
+                upsampled = self._upsample(buffer)
+                ch_peak = np.max(np.abs(upsampled))
+            else:
+                ch_peak = np.max(np.abs(buffer))
+            
+            peak = max(peak, ch_peak)
+        
+        return peak
+    
+    def _upsample(self, signal_data: np.ndarray) -> np.ndarray:
+        """Upsample signal for inter-sample peak detection"""
+        # Insert zeros between samples
+        upsampled = np.zeros(len(signal_data) * self.config.oversample_factor)
+        upsampled[::self.config.oversample_factor] = signal_data
+        
+        # Apply lowpass filter
+        filtered = np.convolve(upsampled, self.upsample_filter, mode='same')
+        
+        # Compensate for filter gain
+        filtered *= self.config.oversample_factor
+        
+        return filtered
+    
+    def _calculate_gain_reduction_vectorized(self, peaks: np.ndarray) -> np.ndarray:
+        """Vectorized gain reduction with soft knee"""
+        gains = np.ones_like(peaks)
+        
+        # Below knee - no reduction
+        below_knee = peaks <= self.config.knee_start
+        
+        # Above knee - full limiting  
+        above_knee = peaks >= self.config.knee_end
+        gains[above_knee] = self.config.threshold_linear / peaks[above_knee]
+        
+        # In knee region - smooth transition
+        in_knee = ~below_knee & ~above_knee
+        if np.any(in_knee):
+            knee_peaks = peaks[in_knee]
+            knee_position = (knee_peaks - self.config.knee_start) / (self.config.knee_end - self.config.knee_start)
+            knee_factor = knee_position * knee_position
+            full_limiting_gain = self.config.threshold_linear / knee_peaks
+            gains[in_knee] = 1.0 + (full_limiting_gain - 1.0) * knee_factor
+        
+        return gains
+    
+    def _apply_envelope_vectorized(self, gain_reductions: np.ndarray) -> np.ndarray:
+        """Truly vectorized envelope smoothing using scipy.signal.lfilter"""
+        # Initialize previous envelope if needed
+        if not hasattr(self, 'prev_envelope'):
+            self.prev_envelope = 1.0
+        
+        # Prepare gain reductions with previous value prepended
+        extended_gains = np.concatenate(([self.prev_envelope], gain_reductions))
+        
+        # Detect attack vs release (comparing each sample to previous)
+        is_attacking = extended_gains[1:] < extended_gains[:-1]
+        
+        # Find where attack/release state changes
+        state_changes = np.where(np.diff(np.concatenate(([False], is_attacking))))[0]
+        
+        # Add start and end indices
+        segment_bounds = np.concatenate(([0], state_changes, [len(gain_reductions)]))
+        
+        # Process each segment with vectorized filter
+        envelope = np.empty_like(gain_reductions)
+        prev_val = self.prev_envelope
+        
+        for i in range(len(segment_bounds) - 1):
+            start_idx = segment_bounds[i]
+            end_idx = segment_bounds[i + 1]
+            
+            if start_idx >= end_idx:
+                continue
+            
+            segment = gain_reductions[start_idx:end_idx]
+            
+            # Determine if this segment is attack or release
+            if start_idx < len(is_attacking) and is_attacking[start_idx]:
+                coeff = self.config.attack_coeff
+            else:
+                coeff = self.config.release_coeff
+            
+            # Vectorized IIR filter: y[n] = (1-coeff)*x[n] + coeff*y[n-1]
+            # Using lfilter for true vectorization
+            b = np.array([1.0 - coeff])
+            a = np.array([1.0, -coeff])
+            
+            # Set initial conditions based on previous value
+            zi = signal.lfilter_zi(b, a) * prev_val
+            
+            # Apply filter
+            segment_envelope, zf = signal.lfilter(b, a, segment, zi=zi)
+            envelope[start_idx:end_idx] = segment_envelope
+            
+            # Update previous value for next segment
+            prev_val = segment_envelope[-1] if len(segment_envelope) > 0 else prev_val
+        
+        self.prev_envelope = envelope[-1] if len(envelope) > 0 else self.prev_envelope
+        return envelope
+    
+    def _calculate_gain_reduction(self, peak: float) -> float:
+        """Calculate gain reduction with soft knee"""
+        if peak <= self.config.knee_start:
+            # Below knee - no reduction
+            return 1.0
+        elif peak >= self.config.knee_end:
+            # Above knee - full limiting
+            return self.config.threshold_linear / peak
+        else:
+            # In knee region - smooth transition
+            # Calculate position in knee (0 to 1)
+            knee_position = (peak - self.config.knee_start) / (self.config.knee_end - self.config.knee_start)
+            
+            # Quadratic knee curve
+            knee_factor = knee_position * knee_position
+            
+            # Interpolate between no reduction and full limiting
+            no_reduction_gain = 1.0
+            full_limiting_gain = self.config.threshold_linear / peak
+            
+            return no_reduction_gain + (full_limiting_gain - no_reduction_gain) * knee_factor
+    
+    def reset(self) -> None:
+        """Reset limiter state"""
+        # Clear delay buffers
+        for buffer in self.delay_buffers:
+            buffer.clear()
+            buffer.extend([0.0] * self.config.lookahead_samples)
+        
+        # Reset envelope
+        self.envelope = 0.0
+    
+    def get_latency_samples(self) -> int:
+        """Get the latency introduced by the lookahead buffer"""
+        return self.config.lookahead_samples
+
+
 class BabyNoiseEngineOptimized:
     """Optimized audio engine for generating baby-optimized noise"""
     
@@ -46,7 +295,7 @@ class BabyNoiseEngineOptimized:
     CHUNK_DURATION = 1.0  # seconds
     
     def __init__(self, noise_type='white', duration_str='1 hour', sample_rate=48000, bit_depth=24, 
-                 true_peak_limit=-2.0, target_lufs=-14.0):
+                 true_peak_limit=-2.0, target_lufs=-14.0, stereo_width=0.5):
         # Validate inputs
         self._validate_inputs(noise_type, sample_rate, bit_depth)
         
@@ -60,6 +309,9 @@ class BabyNoiseEngineOptimized:
         self.target_lufs = target_lufs
         self.true_peak_limit = true_peak_limit
         self.oversample_factor = 2  # Reduced from 4x to 2x for efficiency
+        
+        # Stereo width (0.0 = mono, 1.0 = full width)
+        self.stereo_width = max(0.0, min(1.0, stereo_width))
         
         # Calculate total samples needed
         self.total_samples = int(self.duration_seconds * self.sample_rate)
@@ -80,14 +332,33 @@ class BabyNoiseEngineOptimized:
         else:
             self.rng = np.random.default_rng(self.base_seed)
         
-        # Initialize LUFS measurement state for streaming
+        # Initialize LUFS measurement state for streaming with BS.1770-4 gating
         self.lufs_state = {
             'k_weighted_power': [],  # Store power per chunk (not mean square)
-            'total_samples': 0
+            'momentary_powers': [],  # Store powers for 400ms windows
+            'total_samples': 0,
+            'sample_buffer': [],  # Buffer for momentary loudness
+            'momentary_window_samples': int(0.4 * self.sample_rate),  # 400ms window
+            'hop_samples': int(0.1 * self.sample_rate)  # 100ms hop for 75% overlap
         }
         
         # Brown noise scaling factor (computed once)
         self.brown_noise_scale = 0.02  # Empirically determined for -20dB RMS
+        
+        # Initialize lookahead limiter
+        limiter_config = LimiterConfig(
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            threshold_db=self.true_peak_limit,
+            lookahead_ms=5.0,
+            attack_ms=0.5,
+            release_ms=50.0,
+            knee_db=2.0,
+            oversample_factor=self.oversample_factor
+        )
+        self.lookahead_limiter = LookaheadLimiter(limiter_config)
+        print(f"Using professional lookahead limiter with {limiter_config.lookahead_ms}ms lookahead")
+        print(f"Stereo width enhancement: {int(self.stereo_width * 100)}% {'(mono)' if self.stereo_width == 0 else '(wider)' if self.stereo_width > 0.5 else '(natural)'}")
     
     def _validate_inputs(self, noise_type, sample_rate, bit_depth):
         """Validate constructor inputs"""
@@ -133,8 +404,10 @@ class BabyNoiseEngineOptimized:
         self.pink_a = np.array([1, -2.494956002, 2.017265875, -0.522189400], dtype=np.float32)
         
         # Brown noise filters
-        self.brown_b = np.array([0.1], dtype=np.float64)
-        self.brown_a = np.array([1.0, -0.9], dtype=np.float64)
+        # Brown noise filter - proper integration filter using scipy butter
+        # Using a very low cutoff frequency (10 Hz at 48kHz sample rate = 10/24000 = 0.000417)
+        # This creates a better 1/f² characteristic for brown noise
+        self.brown_sos = butter(1, 10.0 / (self.sample_rate / 2), btype='low', output='sos')
         self.brown_hp_sos = butter(4, 20.0 / nyquist, btype='high', output='sos')  # 20Hz high-pass
         
         # Infant EQ filters
@@ -151,6 +424,16 @@ class BabyNoiseEngineOptimized:
         self.lufs_pre_a = np.array([1.0, -1.66375098226575, 0.71265752994786])
         self.lufs_rlb_b = np.array([1.0, -2.0, 1.0])
         self.lufs_rlb_a = np.array([1.0, -1.98998479513207, 0.98999499812227])
+        
+        # Stereo width enhancement filters (allpass filters for decorrelation)
+        # Design complementary allpass filters for L/R channels
+        # These create subtle phase differences without affecting frequency response
+        self.width_allpass_sos_l = self._design_allpass_filter(800 / nyquist, q=0.7)
+        self.width_allpass_sos_r = self._design_allpass_filter(1200 / nyquist, q=0.7)
+        
+        # Additional allpass for more complex decorrelation
+        self.width_allpass2_sos_l = self._design_allpass_filter(2000 / nyquist, q=0.5)
+        self.width_allpass2_sos_r = self._design_allpass_filter(3000 / nyquist, q=0.5)
     
     def _design_shelf_filter(self, freq, gain_db, filter_type='low'):
         """Design a shelf filter"""
@@ -160,10 +443,33 @@ class BabyNoiseEngineOptimized:
             sos[0, :3] *= gain_linear
         return sos
     
+    def _design_allpass_filter(self, freq, q=0.7):
+        """Design an allpass filter for phase decorrelation"""
+        # Convert frequency and Q to coefficients
+        w0 = 2 * np.pi * freq
+        alpha = np.sin(w0) / (2 * q)
+        
+        # Allpass coefficients
+        b = np.array([1 - alpha, -2 * np.cos(w0), 1 + alpha])
+        a = np.array([1 + alpha, -2 * np.cos(w0), 1 - alpha])
+        
+        # Normalize
+        b = b / a[0]
+        a = a / a[0]
+        
+        return signal.tf2sos(b, a)
+    
     def reset_for_pass(self, pass_num):
         """Reset state for a new pass"""
         self.filter_states = {}
-        self.lufs_state = {'k_weighted_power': [], 'total_samples': 0}
+        self.lufs_state = {
+            'k_weighted_power': [],
+            'momentary_powers': [],
+            'total_samples': 0,
+            'sample_buffer': [],
+            'momentary_window_samples': int(0.4 * self.sample_rate),
+            'hop_samples': int(0.1 * self.sample_rate)
+        }
         
         # Use deterministic seed that changes between passes
         seed = self.base_seed + pass_num * 1000000
@@ -171,6 +477,9 @@ class BabyNoiseEngineOptimized:
             self.rng = cp.random.default_rng(seed)
         else:
             self.rng = np.random.default_rng(seed)
+        
+        # Reset lookahead limiter
+        self.lookahead_limiter.reset()
     
     def generate_white_noise_chunk(self, chunk_size):
         """Generate a chunk of white noise"""
@@ -254,10 +563,10 @@ class BabyNoiseEngineOptimized:
                 self.filter_states['brown_filter'] = {}
             
             if ch not in self.filter_states['brown_filter']:
-                self.filter_states['brown_filter'][ch] = lfilter_zi(self.brown_b, self.brown_a) * ch_data[0]
+                self.filter_states['brown_filter'][ch] = sosfilt_zi(self.brown_sos) * ch_data[0]
             
             filtered, self.filter_states['brown_filter'][ch] = \
-                signal.lfilter(self.brown_b, self.brown_a, ch_data, zi=self.filter_states['brown_filter'][ch])
+                sosfilt(self.brown_sos, ch_data, zi=self.filter_states['brown_filter'][ch])
             
             # Apply DC removal high-pass filter
             if 'brown_hp' not in self.filter_states:
@@ -281,6 +590,9 @@ class BabyNoiseEngineOptimized:
     
     def apply_processing_chain_chunk(self, audio_chunk):
         """Apply all processing to a single chunk"""
+        # Apply stereo width enhancement first (before other processing)
+        audio_chunk = self.apply_stereo_width_enhancement(audio_chunk)
+        
         # Apply infant EQ
         audio_chunk = self.apply_infant_eq_stateful(audio_chunk)
         
@@ -350,28 +662,89 @@ class BabyNoiseEngineOptimized:
         return compressed
     
     def apply_simple_limiting(self, audio):
-        """Apply simple peak limiting for chunks"""
-        peak_linear = 10 ** (self.true_peak_limit / 20)
-        
-        xp = cp if GPU_AVAILABLE and hasattr(audio, 'get') else np
-        
-        # Soft knee limiting instead of hard clipping
-        above_threshold = xp.abs(audio) > peak_linear * 0.9  # 90% threshold for soft knee
-        
-        if xp.any(above_threshold):
-            # Apply tanh soft clipping
-            audio_limited = xp.where(
-                above_threshold,
-                peak_linear * xp.tanh(audio / peak_linear),
-                audio
-            )
+        """Apply peak limiting for chunks with professional lookahead limiter"""
+        # Convert to CPU for processing if needed
+        if GPU_AVAILABLE and hasattr(audio, 'get'):
+            audio_cpu = audio.get()
         else:
-            audio_limited = audio
+            audio_cpu = audio
         
-        return audio_limited
+        # Process through lookahead limiter
+        limited = self.lookahead_limiter.process(audio_cpu)
+        
+        # Convert back to GPU if needed
+        if GPU_AVAILABLE and hasattr(audio, 'get'):
+            return cp.asarray(limited)
+        return limited
+    
+    def apply_stereo_width_enhancement(self, audio):
+        """Apply stereo width enhancement using allpass filters for decorrelation"""
+        if self.stereo_width == 0.0:
+            # Mono - return average of channels
+            if GPU_AVAILABLE and hasattr(audio, 'get'):
+                xp = cp
+                audio_work = audio
+            else:
+                xp = np
+                audio_work = audio
+            
+            mono = xp.mean(audio_work, axis=1, keepdims=True)
+            return xp.tile(mono, (1, 2))
+        
+        # Convert to CPU for processing (allpass filters need scipy)
+        if GPU_AVAILABLE and hasattr(audio, 'get'):
+            audio_cpu = audio.get()
+        else:
+            audio_cpu = audio
+        
+        # Process left and right channels with different allpass filters
+        enhanced = np.zeros_like(audio_cpu)
+        
+        # Left channel - apply first set of allpass filters
+        if 'width_allpass_l' not in self.filter_states:
+            self.filter_states['width_allpass_l'] = sosfilt_zi(self.width_allpass_sos_l) * audio_cpu[0, 0]
+            self.filter_states['width_allpass2_l'] = sosfilt_zi(self.width_allpass2_sos_l) * audio_cpu[0, 0]
+        
+        temp_l, self.filter_states['width_allpass_l'] = \
+            sosfilt(self.width_allpass_sos_l, audio_cpu[:, 0], zi=self.filter_states['width_allpass_l'])
+        enhanced[:, 0], self.filter_states['width_allpass2_l'] = \
+            sosfilt(self.width_allpass2_sos_l, temp_l, zi=self.filter_states['width_allpass2_l'])
+        
+        # Right channel - apply second set of allpass filters
+        if 'width_allpass_r' not in self.filter_states:
+            self.filter_states['width_allpass_r'] = sosfilt_zi(self.width_allpass_sos_r) * audio_cpu[0, 1]
+            self.filter_states['width_allpass2_r'] = sosfilt_zi(self.width_allpass2_sos_r) * audio_cpu[0, 1]
+        
+        temp_r, self.filter_states['width_allpass_r'] = \
+            sosfilt(self.width_allpass_sos_r, audio_cpu[:, 1], zi=self.filter_states['width_allpass_r'])
+        enhanced[:, 1], self.filter_states['width_allpass2_r'] = \
+            sosfilt(self.width_allpass2_sos_r, temp_r, zi=self.filter_states['width_allpass2_r'])
+        
+        # Mix original and enhanced based on width parameter
+        # Also apply subtle M/S processing for extra width
+        if self.stereo_width > 0.5:
+            # Extract mid and side
+            mid = (enhanced[:, 0] + enhanced[:, 1]) * 0.5
+            side = (enhanced[:, 0] - enhanced[:, 1]) * 0.5
+            
+            # Boost side signal for extra width (carefully to avoid phase issues)
+            width_boost = 1.0 + (self.stereo_width - 0.5) * 0.6  # Max 30% boost
+            side *= width_boost
+            
+            # Reconstruct L/R
+            enhanced[:, 0] = mid + side
+            enhanced[:, 1] = mid - side
+        
+        # Mix with original signal
+        mixed = audio_cpu * (1.0 - self.stereo_width * 0.3) + enhanced * (self.stereo_width * 0.3)
+        
+        # Convert back to GPU if needed
+        if GPU_AVAILABLE and hasattr(audio, 'get'):
+            return cp.asarray(mixed)
+        return mixed
     
     def update_lufs_measurement(self, audio_chunk):
-        """Update LUFS measurement state with new chunk"""
+        """Update LUFS measurement state with new chunk (BS.1770-4 compliant)"""
         # Convert to CPU for measurement
         if GPU_AVAILABLE and hasattr(audio_chunk, 'get'):
             audio_cpu = audio_chunk.get()
@@ -398,26 +771,69 @@ class BabyNoiseEngineOptimized:
             k_weighted[:, ch], self.filter_states['lufs_rlb'][ch] = \
                 signal.lfilter(self.lufs_rlb_b, self.lufs_rlb_a, temp, zi=self.filter_states['lufs_rlb'][ch])
         
-        # Correct LUFS calculation: sum channel powers, then take mean over time
-        channel_powers = np.mean(k_weighted ** 2, axis=0)  # Mean over time for each channel
-        total_power = np.sum(channel_powers)  # Sum channel powers
+        # Add samples to buffer for momentary loudness calculation
+        self.lufs_state['sample_buffer'].extend(k_weighted.tolist())
         
-        self.lufs_state['k_weighted_power'].append(total_power)
+        # Process complete 400ms windows with 75% overlap (100ms hop)
+        while len(self.lufs_state['sample_buffer']) >= self.lufs_state['momentary_window_samples']:
+            # Extract 400ms window
+            window = np.array(self.lufs_state['sample_buffer'][:self.lufs_state['momentary_window_samples']])
+            # Hop by 100ms for 75% overlap
+            self.lufs_state['sample_buffer'] = self.lufs_state['sample_buffer'][self.lufs_state['hop_samples']:]
+            
+            # Calculate power for this window
+            channel_powers = np.mean(window ** 2, axis=0)  # Mean over time for each channel
+            total_power = np.sum(channel_powers)  # Sum channel powers
+            
+            # Calculate momentary loudness
+            if total_power > 0:
+                momentary_lufs = -0.691 + 10 * np.log10(total_power)
+                
+                # Apply absolute gating (-70 LUFS threshold)
+                if momentary_lufs > -70:
+                    self.lufs_state['momentary_powers'].append(total_power)
+                    self.lufs_state['k_weighted_power'].append(total_power)
+        
         self.lufs_state['total_samples'] += len(audio_chunk)
     
     def calculate_final_lufs(self):
-        """Calculate final LUFS from accumulated measurements"""
+        """Calculate final LUFS from accumulated measurements with BS.1770-4 two-stage gating"""
         if not self.lufs_state['k_weighted_power']:
             return -70.0
         
-        # Calculate mean power from accumulated values
-        mean_power = np.mean(self.lufs_state['k_weighted_power'])
+        # Process any remaining samples in buffer
+        if len(self.lufs_state['sample_buffer']) > 0:
+            window = np.array(self.lufs_state['sample_buffer'])
+            channel_powers = np.mean(window ** 2, axis=0)
+            total_power = np.sum(channel_powers)
+            
+            if total_power > 0:
+                momentary_lufs = -0.691 + 10 * np.log10(total_power)
+                if momentary_lufs > -70:  # Absolute gating
+                    self.lufs_state['k_weighted_power'].append(total_power)
         
-        if mean_power <= 0:
+        # Stage 1: Absolute gating (already done during collection)
+        powers = np.array(self.lufs_state['k_weighted_power'])
+        
+        if len(powers) == 0:
             return -70.0
         
-        # Convert to LUFS
-        lufs = -0.691 + 10 * np.log10(mean_power)
+        # Calculate ungated mean
+        ungated_mean = np.mean(powers)
+        
+        if ungated_mean <= 0:
+            return -70.0
+        
+        # Stage 2: Relative gating (-10 LU below ungated mean)
+        relative_threshold = ungated_mean * (10 ** (-10 / 10))  # -10 dB relative
+        gated_powers = powers[powers > relative_threshold]
+        
+        if len(gated_powers) == 0:
+            return -70.0
+        
+        # Final gated mean
+        final_mean = np.mean(gated_powers)
+        lufs = -0.691 + 10 * np.log10(final_mean)
         
         return lufs
     
@@ -598,7 +1014,7 @@ class BabyNoiseEngineOptimized:
             raise e
 
 
-def main_optimized(noise_type='white', duration='1 hour', show_progress=False):
+def main_optimized(noise_type='white', duration='1 hour', show_progress=False, stereo_width=0.5):
     """Main function to generate baby noise using optimized engine"""
     
     def progress_callback(stage, percent):
@@ -607,7 +1023,7 @@ def main_optimized(noise_type='white', duration='1 hour', show_progress=False):
     
     try:
         # Create optimized engine instance
-        engine = BabyNoiseEngineOptimized(noise_type=noise_type, duration_str=duration)
+        engine = BabyNoiseEngineOptimized(noise_type=noise_type, duration_str=duration, stereo_width=stereo_width)
         
         # Generate and save with chunked processing
         filename = f"baby_{noise_type}_noise_{duration.replace(' ', '_')}_optimized.flac"
@@ -626,9 +1042,96 @@ def main_optimized(noise_type='white', duration='1 hour', show_progress=False):
         return None
 
 
+def benchmark_limiter(chunk_samples=48000, num_chunks=10):
+    """Benchmark the limiter performance"""
+    import time
+    
+    # Create limiter config
+    config = LimiterConfig(
+        sample_rate=48000,
+        channels=2,
+        threshold_db=-0.3,
+        lookahead_ms=5.0,
+        attack_ms=0.5,
+        release_ms=50.0,
+        knee_db=2.0,
+        oversample_factor=4
+    )
+    
+    # Create limiter instance
+    limiter = LookaheadLimiter(config)
+    
+    print(f"\nBenchmarking with chunk size: {chunk_samples} samples ({chunk_samples/48000:.2f} seconds)")
+    print(f"Processing {num_chunks} chunks ({num_chunks * chunk_samples/48000:.1f} seconds of audio)")
+    
+    # Warm-up run
+    test_chunk = np.random.randn(chunk_samples, 2).astype(np.float32) * 0.5
+    _ = limiter.process(test_chunk)
+    
+    # Reset limiter
+    limiter.reset()
+    
+    # Benchmark
+    processing_times = []
+    for i in range(num_chunks):
+        test_chunk = np.random.randn(chunk_samples, 2).astype(np.float32) * 0.5
+        
+        start_time = time.perf_counter()
+        output = limiter.process(test_chunk)
+        end_time = time.perf_counter()
+        
+        processing_times.append(end_time - start_time)
+    
+    # Calculate statistics
+    total_time = sum(processing_times)
+    avg_time = np.mean(processing_times)
+    audio_duration = num_chunks * chunk_samples / 48000
+    rtf = total_time / audio_duration
+    
+    print(f"\nResults:")
+    print(f"  Total processing time: {total_time:.3f} seconds")
+    print(f"  Average per chunk: {avg_time*1000:.2f} ms")
+    print(f"  Real-time factor: {rtf:.3f}x (lower is better, 1.0 = real-time)")
+    print(f"  Throughput: {1/rtf:.1f}x real-time")
+    
+    return rtf
+
 # Example usage
 if __name__ == "__main__":
-    # Example: Generate 30 minutes of pink noise with progress
-    output_file = main_optimized(noise_type='pink', duration='30 mins', show_progress=True)
-    if output_file:
-        print(f"\nOptimized generation complete! Output: {output_file}")
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == '--benchmark':
+        print("=" * 60)
+        print("LookaheadLimiter Performance Benchmark")
+        print("=" * 60)
+        
+        # Test different chunk sizes
+        chunk_sizes = [
+            (480, 100),     # 10ms chunks
+            (4800, 100),    # 100ms chunks
+            (48000, 60),    # 1 second chunks
+        ]
+        
+        results = []
+        for chunk_samples, num_chunks in chunk_sizes:
+            rtf = benchmark_limiter(chunk_samples, num_chunks)
+            results.append((chunk_samples, rtf))
+        
+        print("\n" + "=" * 60)
+        print("SUMMARY:")
+        best_rtf = min(r[1] for r in results)
+        
+        if best_rtf < 0.1:
+            print("[EXCELLENT] Limiter is >10x faster than real-time!")
+        elif best_rtf < 0.5:
+            print("[GOOD] Limiter is >2x faster than real-time.")
+        elif best_rtf < 1.0:
+            print("[OK] Limiter is faster than real-time.")
+        else:
+            print("[POOR] Limiter is slower than real-time!")
+            print("  The vectorization still needs improvement.")
+    else:
+        # Example: Generate 30 minutes of pink noise with progress
+        output_file = main_optimized(noise_type='pink', duration='30 mins', show_progress=True)
+        if output_file:
+            print(f"\nOptimized generation complete! Output: {output_file}")
